@@ -550,7 +550,7 @@ class SaxiAELoggerNeptune(Callback):
     
 class SaxiDenoiseUnetLoggerNeptune(Callback):
     # This callback logs images for visualization during training, with the ability to log images to the Neptune logging system for easy monitoring and analysis
-    def __init__(self, num_surf=8, log_steps=10, num_steps=10):
+    def __init__(self, num_surf=12, log_steps=10, num_steps=10):
         self.log_steps = log_steps
         self.num_surf = num_surf
         self.num_steps = num_steps
@@ -655,7 +655,7 @@ class SaxiDenoiseUnetLoggerNeptune(Callback):
 
 class SaxiDDPMLoggerNeptune(Callback):
     # This callback logs images for visualization during training, with the ability to log images to the Neptune logging system for easy monitoring and analysis
-    def __init__(self, num_surf=1, log_steps=10, num_steps=10):
+    def __init__(self, num_surf=5, log_steps=10, num_steps=5):
         self.log_steps = log_steps
         self.num_surf = num_surf
         self.num_steps = num_steps
@@ -663,9 +663,26 @@ class SaxiDDPMLoggerNeptune(Callback):
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx): 
         # This function is called at the end of each training batch
         if pl_module.global_step % self.log_steps == 0:
-
+            
+            pl_module.eval()
             with torch.no_grad():
-                V, F = batch
+
+                if isinstance(batch, tuple) or isinstance(batch, list):
+                    V, F = batch        
+                    X_mesh = pl_module.create_mesh(V, F)
+                    X = pl_module.sample_points_from_meshes(X_mesh, pl_module.hparams.num_samples)
+                    if hasattr(pl_module, 'sorter'):
+                        X = pl_module.sorter(X)
+                elif isinstance(batch, dict):
+                    X = batch['pointcloud']
+                else:
+                    X = batch
+                
+                fig = self.plot_diffusion(X[0:self.num_surf].cpu().numpy())
+                trainer.logger.experiment["images/batch"].upload(fig)
+                
+
+                # V, F = batch
 
                 # n = min(V.shape[0], self.num_surf)
 
@@ -676,21 +693,61 @@ class SaxiDDPMLoggerNeptune(Callback):
 
                 # X = pl_module.sample_points_from_meshes(X_mesh, pl_module.hparams.num_samples)
                 X = torch.randn((1, pl_module.hparams.num_samples, 3)).to(pl_module.device)
-                X_gen = []
-
-                num_diff_steps = int(pl_module.hparams.num_train_steps/self.num_steps)
-
-                for i, t in enumerate(range(pl_module.hparams.num_train_steps)):
-                    residual = pl_module(X, t)  # Again, note that we pass in our labels y
-
-                    X = pl_module.noise_scheduler.step(residual, t, X).prev_sample
-                    
-                    if i % num_diff_steps == 0:
-                        X_gen.append(X)
                 
-                fig = self.plot_diffusion(torch.cat(X_gen, dim=0).cpu().numpy())
-                # fig = self.plot_pointclouds(X.cpu().numpy(), X_noised.cpu().numpy(), X_hat.cpu().numpy())
-                trainer.logger.experiment["images/surf"].upload(fig)
+                if hasattr(pl_module, 'sample'):
+                    pc, intermediates = pl_module.sample(intermediate_steps=self.num_steps)
+                    
+                    fig = self.plot_diffusion(torch.cat(intermediates, dim=0).cpu().numpy())
+                    trainer.logger.experiment["images/intermediates"].upload(fig)
+
+                elif hasattr(pl_module, 'inferer'):
+                    
+                    pl_module.noise_scheduler.set_timesteps(num_inference_steps=pl_module.hparams.num_train_steps)
+
+                    context = None
+
+                    if hasattr(pl_module, 'flow'):
+                        context = pl_module.flow.sample(X.shape[0])
+
+                    pc, intermediates = pl_module.inferer.sample(
+                        input_noise=X, 
+                        diffusion_model=pl_module, 
+                        scheduler=pl_module.noise_scheduler, 
+                        save_intermediates=True, 
+                        intermediate_steps=pl_module.hparams.num_train_steps//self.num_steps, 
+                        verbose=False,
+                        conditioning=context
+                    )
+
+                    fig = self.plot_diffusion(torch.cat(intermediates, dim=0).cpu().numpy())
+                    trainer.logger.experiment["images/intermediates"].upload(fig)
+
+                else:
+
+                    X_gen = []
+                    X_orig_sample = []
+
+                    num_diff_steps = int(pl_module.hparams.num_train_steps/self.num_steps)
+
+                    for i, t in enumerate(range(pl_module.hparams.num_train_steps)):
+                        residual = pl_module(X, t)  
+
+                        scheduler_output = pl_module.noise_scheduler.step(residual, t, X)
+
+                        X = scheduler_output.prev_sample
+                        
+                        if i % num_diff_steps == 0:
+                            X_gen.append(X)
+
+                        if i % num_diff_steps == 0:
+                            X_orig_sample.append(scheduler_output.pred_original_sample)
+                    
+                    fig = self.plot_diffusion(torch.cat(X_gen, dim=0).cpu().numpy())
+                    # fig = self.plot_pointclouds(X.cpu().numpy(), X_noised.cpu().numpy(), X_hat.cpu().numpy())
+                    trainer.logger.experiment["images/prev_sample"].upload(fig)
+
+                    fig = self.plot_diffusion(torch.cat(X_orig_sample, dim=0).cpu().numpy())
+                    trainer.logger.experiment["images/pred_original_sample"].upload(fig)
 
     def plot_diffusion(self, X):
         num_surf = len(X)
@@ -1246,3 +1303,297 @@ class SaxiMHAFBIdxBLoggerNeptune(Callback):
         return fig 
     
 
+
+
+
+class SaxiMHAFBIdxBLoggerNeptune(Callback):
+    # This callback logs images for visualization during training, with the ability to log images to the Neptune logging system for easy monitoring and analysis
+    def __init__(self, num_surf=1, log_steps=10):
+        self.log_steps = log_steps
+        self.num_surf = num_surf
+        self.num_samples = 1000
+        self.num_images = 12
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx): 
+        # This function is called at the end of each training batch
+        if batch_idx % self.log_steps == 0:
+
+            with torch.no_grad():
+                V, F, CN, Y = batch
+
+                X_mesh = pl_module.create_mesh(V, F, CN)
+
+                X_samples = pl_module.sample_points_from_meshes(X_mesh, self.num_samples)
+                x_v_fixed = pl_module.sample_uniform(X_mesh.verts_list(),4096)
+                
+                fig = self.plot_pointclouds(X_samples[0].cpu().numpy())
+                trainer.logger.experiment["images/surf"].upload(fig)
+
+                fig = self.plot_pointclouds(x_v_fixed[0].cpu().numpy())
+                trainer.logger.experiment["images/x_v_fixed"].upload(fig)
+
+                X_fb, X_PF = pl_module.render(X_mesh)
+                
+                X_img = X_fb[0,:,0:3].permute(0,2,3,1).squeeze().cpu().numpy()
+                X_img = (X_img - X_img.min()) / (X_img.max() - X_img.min())*255
+                X_img_zbuf = X_fb[0,:,3:4].permute(0,2,3,1).squeeze().cpu().numpy()
+
+                fig = self.create_figure(X_img[0:self.num_images], X_img_zbuf[0:self.num_images])
+                trainer.logger.experiment["images/fb"].upload(fig)
+
+    
+    def plot_pointclouds(self, X):
+    
+
+        fig = make_subplots(
+            rows=1, cols=1,
+            specs=[[{'type': 'scatter3d'}]]
+        )
+
+        # First scatter plot
+        fig.add_trace(
+            go.Scatter3d(x=X[:,0], y=X[:,1], z=X[:,2], mode='markers', marker=dict(
+                size=2,
+                color=X[:,2],                # set color to an array/list of desired values
+                colorscale='Viridis',   # choose a colorscale
+                opacity=0.8
+            )),
+            row=1, col=1
+        )
+
+        # Update the layout if necessary
+        fig.update_layout(height=600, width=600, title_text="Side-by-Side 3D Scatter Plots")
+
+        return fig
+    
+    def create_figure(self, image_data1, image_data2):
+        fig = make_subplots(rows=1, cols=2, subplot_titles=('Image 1', 'Image 2'))
+
+        # Add initial frames for both images with shared coloraxis
+        fig.add_trace(go.Image(z=image_data1[0]), row=1, col=1)
+        fig.add_trace(go.Heatmap(z=image_data2[0], coloraxis="coloraxis"), row=1, col=2)
+
+        # Create frames for the animation
+        frames = []
+        for k in range(image_data1.shape[0]):
+            frame = go.Frame(data=[
+                go.Image(z=image_data1[k]),
+                go.Heatmap(z=image_data2[k], coloraxis="coloraxis")
+            ], name=str(k))
+            frames.append(frame)
+
+        # Add frames to the figure
+        fig.frames = frames
+
+        # Calculate the aspect ratio
+        height, width = image_data1[0].shape[:2]
+        aspect_ratio = height / width
+
+        # Determine global min and max values for consistent color scale
+        # vmin = min(image_data1.min(), image_data2.min())
+        # vmax = max(image_data1.max(), image_data2.max())
+        vmin = image_data2.min()
+        vmax = image_data2.max()
+
+        # Update layout with animation settings and fixed aspect ratio
+        fig.update_layout(
+            autosize=False,
+            width=1200,  # Adjust width as needed
+            height=600,  # Adjust height according to aspect ratio
+            coloraxis={"colorscale": "jet",
+                    "cmin": vmin,  # Set global min value for color scale
+                        "cmax": vmax},   # Set global max value for color scale},  # Set colorscale for the shared coloraxis
+            updatemenus=[{
+                "buttons": [
+                    {
+                        "args": [None, {"frame": {"duration": 500, "redraw": True},
+                                        "fromcurrent": True, "mode": "immediate"}],
+                        "label": "Play",
+                        "method": "animate"
+                    },
+                    {
+                        "args": [[None], {"frame": {"duration": 0, "redraw": False},
+                                        "mode": "immediate"}],
+                        "label": "Pause",
+                        "method": "animate"
+                    }
+                ],
+                "direction": "left",
+                "pad": {"r": 10, "t": 87},
+                "showactive": False,
+                "type": "buttons",
+                "x": 0.1,
+                "xanchor": "right",
+                "y": 0,
+                "yanchor": "top"
+            }],
+            sliders=[{
+                "steps": [
+                    {
+                        "args": [[str(k)], {"frame": {"duration": 300, "redraw": True},
+                                            "mode": "immediate"}],
+                        "label": str(k),
+                        "method": "animate"
+                    } for k in range(image_data1.shape[0])
+                ],
+                "active": 0,
+                "yanchor": "top",
+                "xanchor": "left",
+                "currentvalue": {
+                    "font": {"size": 20},
+                    "prefix": "Frame:",
+                    "visible": True,
+                    "xanchor": "right"
+                },
+                "transition": {"duration": 300, "easing": "cubic-in-out"}
+            }]
+        )
+        return fig 
+    
+
+
+
+class SaxiNeRFLoggerNeptune(Callback):
+    # This callback logs images for visualization during training, with the ability to log images to the Neptune logging system for easy monitoring and analysis
+    def __init__(self, log_steps = 10, *args, **kwargs):
+        self.log_steps = log_steps
+
+    @staticmethod
+    def add_logger_specific_args(parent_parser):
+        logger_group = parent_parser.add_argument_group(title='NeRF Logger')
+        logger_group.add_argument('--log_steps', type=int, help='Log steps for the callback (neptune)', default=50)
+        return parent_parser
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx): 
+        # This function is called at the end of each training batch
+        if pl_module.global_step % self.log_steps == 0:
+
+            pl_module.eval()
+            with torch.no_grad():
+
+                images, poses = batch
+
+                
+                ray_origins, ray_directions = pl_module.generate_rays(poses)
+                # ray_origins, ray_directions = pl_module.get_rays(poses[0])
+
+
+                # rgb = []
+                # depth = []
+                # acc = []
+
+                # for r_o, r_d in zip(torch.chunk(ray_origins, chunks=32, dim=1), torch.chunk(ray_directions, chunks=32, dim=1)):
+                #     r, d, a = pl_module.render_rays(r_o, r_d)            
+                #     rgb.append(r)
+                #     depth.append(d)
+                #     acc.append(a)
+
+                # rgb = torch.cat(rgb, dim=1)
+                # depth = torch.cat(depth, dim=1)
+                # acc = torch.cat(acc, dim=1)
+
+                rgb, depth, acc = pl_module.render_rays(ray_origins, ray_directions)
+
+                rgb = rgb.reshape(1, pl_module.hparams.height, pl_module.hparams.width, 3).cpu().numpy()*255
+                depth = depth.reshape(-1, pl_module.hparams.height, pl_module.hparams.width).cpu().numpy()
+                acc = acc.reshape(-1, pl_module.hparams.height, pl_module.hparams.width).cpu().numpy()
+
+                # rgb = rgb.reshape(-1, 3, pl_module.hparams.height, pl_module.hparams.width).permute(0, 2, 3, 1).cpu().numpy()*255
+                # depth = depth.reshape(-1, pl_module.hparams.height, pl_module.hparams.width).cpu().numpy()
+                # acc = acc.reshape(-1, pl_module.hparams.height, pl_module.hparams.width).cpu().numpy()
+                
+
+                fig = self.create_figure(images.cpu().numpy()*255, rgb, depth, acc)
+                trainer.logger.experiment["images/NeRF"].upload(fig)
+
+    def create_figure(self, images, rgb, depth, acc):
+        fig = make_subplots(rows=2, cols=3, subplot_titles=('Images', '', '', 'RGB', 'Depth', 'Acc'))
+
+        # Add initial frames for both images with shared coloraxis
+        fig.add_trace(go.Image(z=images[0]), row=1, col=1)
+        fig.add_trace(go.Image(z=rgb[0]), row=2, col=1)
+        fig.add_trace(go.Heatmap(z=depth[0], coloraxis="coloraxis"), row=2, col=2)
+        fig.add_trace(go.Heatmap(z=acc[0], coloraxis="coloraxis"), row=2, col=3)
+
+        fig.update_layout(
+            autosize=False,
+            width=1200,  # Adjust width as needed
+            height=1200,  # Adjust height according to aspect ratio
+            coloraxis={"colorscale": "jet"},   # Set colorscale for the shared coloraxis
+        )
+
+        return fig
+    
+    def create_animation(self, rgb, depth, acc):
+        fig = make_subplots(rows=1, cols=3, subplot_titles=('RGB', 'Depth', 'Acc'))
+
+        # Add initial frames for both images with shared coloraxis
+        fig.add_trace(go.Image(z=rgb[0]), row=1, col=1)
+        fig.add_trace(go.Heatmap(z=depth[0], coloraxis="coloraxis"), row=1, col=2)
+        fig.add_trace(go.Heatmap(z=acc[0], coloraxis="coloraxis"), row=1, col=3)
+
+        # Create frames for the animation
+        frames = []
+        for k in range(rgb.shape[0]):
+            frame = go.Frame(data=[
+                go.Image(z=rgb[k]),
+                go.Heatmap(z=depth[k], coloraxis="coloraxis"),
+                go.Heatmap(z=acc[k], coloraxis="coloraxis")
+            ], name=str(k))
+            frames.append(frame)
+        
+        # Add frames to the figure
+        fig.frames = frames
+
+        # Update layout with animation settings and fixed aspect ratio
+        fig.update_layout(
+            autosize=False,
+            width=1200,  # Adjust width as needed
+            height=600,  # Adjust height according to aspect ratio
+            coloraxis={"colorscale": "jet"},   # Set colorscale for the shared coloraxis
+            updatemenus=[{
+                "buttons": [
+                    {
+                        "args": [None, {"frame": {"duration": 500, "redraw": True},
+                                        "fromcurrent": True, "mode": "immediate"}],
+                        "label": "Play",
+                        "method": "animate"
+                    },
+                    {
+                        "args": [[None], {"frame": {"duration": 0, "redraw": False},
+                                        "mode": "immediate"}],
+                        "label": "Pause",
+                        "method": "animate"
+                    }
+                ],
+                "direction": "left",
+                "pad": {"r": 10, "t": 87},
+                "showactive": False,
+                "type": "buttons",
+                "x": 0.1,
+                "xanchor": "right",
+                "y": 0,
+                "yanchor": "top"
+            }],
+            sliders=[{
+                "steps": [
+                    {
+                        "args": [[str(k)], {"frame": {"duration": 300, "redraw": True},
+                                            "mode": "immediate"}],
+                        "label": str(k),
+                        "method": "animate"
+                    } for k in range(rgb.shape[0])
+                ],
+                "active": 0,
+                "yanchor": "top",
+                "xanchor": "left",
+                "currentvalue": {
+                    "font": {"size": 20},
+                    "prefix": "Frame:",
+                    "visible": True,
+                    "xanchor": "right"
+                },
+                "transition": {"duration": 300, "easing": "cubic-in-out"}
+            }]
+        )
+        return fig
