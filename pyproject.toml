@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.26.1"]
 build-backend = "hatchling.build"
 
 [project.scripts]
@@ -16,7 +16,8 @@ license = "MIT"
 keywords = ["Shape Analysis",]
 authors = [
   { name = "juanprietob", email = "juanprietob@gmail.com" },
-  { name = "FlorianDAVAUX", email = "florian.davaux@cpe.fr" }
+  { name = "FlorianDAVAUX", email = "florian.davaux@cpe.fr" },
+  { name = "LucieDole", email = "dolelucie0@gmail.com" }
 ]
 
 classifiers = [
