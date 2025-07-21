@@ -872,26 +872,62 @@ class SaxiClassLoggerNeptune(Callback):
 
         return fig
     
+class SaxiHilbertLoggerNeptune(Callback):
+    # This callback logs images for visualization during training, with the ability to log images to the Neptune logging system for easy monitoring and analysis
+    def __init__(self, log_steps = 10, *args, **kwargs):
+        self.log_steps = log_steps
 
+    @staticmethod
+    def add_logger_specific_args(parent_parser):
+        logger_group = parent_parser.add_argument_group(title='NeRF Logger')
+        logger_group.add_argument('--log_steps', type=int, help='Log steps for the callback (neptune)', default=50)
+        return parent_parser
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx): 
+        # This function is called at the end of each training batch
+        if batch_idx % self.log_steps == 0:
+
+            X, Y = batch
+            X = pl_module.create_hilbert_representation(X)
+            n_cols= int(X.shape[0] /2)
+            fig, axs = plt.subplots(2, n_cols)
+            axs = axs.flatten()
+            for ax, xi in zip(axs,X):
+
+                normed = (xi -xi.min()) / (xi.max() - xi.min())
+                ax.imshow(normed.cpu().detach().permute(1,2,0).numpy())
+                ax.axis('off') 
+            plt.tight_layout()
+            trainer.logger.experiment["fig/img"].upload(fig)
+            plt.close()
 
 class SaxiClassMHAFBLoggerNeptune(Callback):
     # This callback logs images for visualization during training, with the ability to log images to the Neptune logging system for easy monitoring and analysis
-    def __init__(self, num_surf=1, log_steps=10):
+    def __init__(self, num_surf=1, log_steps=10, num_images=12, *args, **kwargs):
         self.log_steps = log_steps
         self.num_surf = num_surf
         self.num_samples = 1000
-        self.num_images = 12
+        self.num_images = num_images
+    
+    @staticmethod
+    def add_logger_specific_args(parent_parser):
+        logger_group = parent_parser.add_argument_group(title='MHAFB Logger')
+        logger_group.add_argument('--log_steps', type=int, help='Log steps for the callback (neptune)', default=50)
+        logger_group.add_argument('--num_surf', type=int, help='Log steps for the callback (neptune)', default=50)
+        logger_group.add_argument('--num_images', type=int, help='Log steps for the callback (neptune)', default=50)
+        return parent_parser
+
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx): 
         # This function is called at the end of each training batch
         if batch_idx % self.log_steps == 0:
 
             with torch.no_grad():
-                V, F, CN, Y = batch
+                X_samples, V, F, CN, Y = batch
 
                 X_mesh = pl_module.create_mesh(V, F, CN)
 
-                X_samples = pl_module.sample_points_from_meshes(X_mesh, self.num_samples)
+                # X_samples = pl_module.sample_points_from_meshes(X_mesh, self.num_samples)
                 
                 fig = self.plot_pointclouds(X_samples[0].cpu().numpy())
                 trainer.logger.experiment["images/surf"].upload(fig)

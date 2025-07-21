@@ -234,7 +234,79 @@ class MHAEncoder(nn.Module):
             x = self.final_proj(x)
             return x
     
+class MHAFBEncoder(nn.Module):
+    def __init__(self, input_dim=3, embed_dim=256, hidden_dim=64, num_heads=256, K=32, output_dim=256, sample_levels=[40962, 10242, 2562, 642, 162], dropout=0.1, return_sorted=True):
+        super(MHAFBEncoder, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.K = K
+        self.sample_levels = sample_levels
+        self.dropout = dropout
+        self.return_sorted = return_sorted
 
+        self.embedding = nn.Linear(input_dim, embed_dim)
+
+        for i, sl in enumerate(sample_levels):
+            setattr(self, f"mha_{i}", MHA_KNN(embed_dim=embed_dim, num_heads=num_heads, K=K, return_weights=True, dropout=dropout))
+            setattr(self, f"ff_{i}", Residual(FeedForward(embed_dim, hidden_dim=hidden_dim, dropout=dropout)))
+        
+        self.output = nn.Linear(embed_dim, output_dim)
+    
+    def sample_points(self, x, Ns):
+        """
+        Samples Ns points from each batch in a tensor of shape (Bs, N, F).
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (Bs, N, F).
+            Ns (int): Number of points to sample from each batch.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (Bs, Ns, F).
+        """
+        Bs, N, F = x.shape
+
+        # Generate random indices for sampling
+        indices = torch.randint(low=0, high=N, size=(Bs, Ns), device=x.device).unsqueeze(-1)
+
+        # Gather the sampled points
+        x = knn_gather(x, indices).squeeze(-2).contiguous()
+
+        return x, indices
+        
+    def forward(self, x):
+        
+        x = self.embedding(x)
+
+        weights = torch.zeros(x.shape[0], x.shape[1], device=x.device)
+        idx = torch.arange(x.shape[1], device=x.device).unsqueeze(0).expand(x.shape[0], -1)
+        
+        indices = []
+        
+        for i, sl in enumerate(self.sample_levels):
+            
+            if i > 0:
+                # select the first sl points a.k.a. downsample/pooling                
+                x, x_i = self.sample_points(x, sl)
+
+                # initialize idx with the index of the current level
+                idx = x_i
+                
+                for idx_prev in reversed(indices): # go through the list of the previous ones in reverse
+                    idx = knn_gather(idx_prev, idx).squeeze(-2).contiguous() # using the indices of the previous level update idx, at the end idx should have the indices of the first level
+                
+                idx = idx.squeeze(-1)
+                indices.append(x_i)
+            
+            # the mha will select optimal points from the input
+            x, x_w = getattr(self, f"mha_{i}")(x)
+            x = getattr(self, f"ff_{i}")(x)
+            
+            weights.scatter_add_(1, idx, x_w)
+
+        #output layer
+        x = self.output(x)
+        return x, weights
+    
 class MHADecoder(nn.Module):
     def __init__(self, input_dim=3, embed_dim=128, output_dim=3, num_heads=4, sample_levels=1, K=4, dropout=0.1, return_sorted=True):
         super(MHADecoder, self).__init__()
@@ -675,7 +747,94 @@ class MHAIdxEncoder(nn.Module):
         if self.return_v:
             return x, x_v, unpooling_idxs
         return x, unpooling_idxs
+
+class MHFBAIdxEncoder(nn.Module):
+    def __init__(self,  input_dim=3, output_dim=1, K=[27], num_heads=[16], stages=[16], dropout=0.1, pooling_factor=None, pooling_hidden_dim=None, score_pooling=False, feed_forward_hidden_dim=None, return_sorted=True, use_skip_connection=False, use_layer_norm=False, return_v=False, use_direction=False, time_embed_dim=None):
+        super(MHFBAIdxEncoder, self).__init__()
+
+        self.num_heads = num_heads        
+        self.K = K
+        self.stages = stages
+        self.dropout = dropout        
+        self.pooling_factor = pooling_factor
+        self.pooling_hidden_dim = pooling_hidden_dim
+        self.score_pooling = score_pooling
+        self.feed_forward_hidden_dim = feed_forward_hidden_dim
+        self.use_skip_connection = use_skip_connection
+        self.use_layer_norm = use_layer_norm
+        self.return_v = return_v
+        self.time_embed_dim = time_embed_dim
+
+        self.embedding = nn.Linear(input_dim, self.stages[0], bias=False)
+
+        for i, st in enumerate(self.stages):
+
+            if time_embed_dim is not None:
+                setattr(self, f"time_embedding_{i}", nn.Linear(time_embed_dim, st, bias=False))
+
+            if self.use_layer_norm:
+                setattr(self, f"norm_mha_{i}", nn.LayerNorm(st))
+            setattr(self, f"mha_{i}", Residual(MHA_KNN_V(embed_dim=st, num_heads=num_heads[i], K=K[i], dropout=dropout, return_sorted=return_sorted, use_direction=use_direction)))
+
+            if self.feed_forward_hidden_dim is not None and feed_forward_hidden_dim[i] is not None:
+                if self.use_layer_norm:
+                    setattr(self, f"norm_ff_{i}", nn.LayerNorm(st))
+                setattr(self, f"ff_{i}", Residual(FeedForward(embed_dim=st, hidden_dim=feed_forward_hidden_dim[i], dropout=dropout)))
+
+            if self.pooling_factor is not None and self.pooling_factor[i] is not None and self.pooling_hidden_dim is not None and self.pooling_hidden_dim[i] is not None: 
+                setattr(self, f"pool_{i}", AttentionPooling_V(embed_dim=st, hidden_dim=self.pooling_hidden_dim[i], K=self.K[i], pooling_factor=self.pooling_factor[i], score_pooling=self.score_pooling))
+            
+            st_n = self.stages[i+1] if i+1 < len(self.stages) else output_dim
+            setattr(self, f"output_{i}", nn.Linear(st, st_n, bias=False))
+
+            if time_embed_dim is not None:
+                time_embed_dim = st
+        
+    def forward(self, x, x_v, time=None):
+        
+        x = self.embedding(x)
+
+        unpooling_idxs = []
+        skip_connections = []
+        
+        for i, st in enumerate(self.stages):
+
+            if time is not None:
+                time = getattr(self, f"time_embedding_{i}")(time)
+                x += time.unsqueeze(1)
+
+            if self.use_layer_norm:
+                x = getattr(self, f"norm_mha_{i}")(x)
+            
+            x = getattr(self, f"mha_{i}")(x, x_v)
+            
+            if self.feed_forward_hidden_dim is not None and self.feed_forward_hidden_dim[i] is not None:
+                if self.use_layer_norm:
+                    x = getattr(self, f"norm_ff_{i}")(x)
+                x = getattr(self, f"ff_{i}")(x)
+
+            if self.use_skip_connection:
+                skip_connections.insert(0, x)
+
+            if self.pooling_factor is not None and self.pooling_factor[i] is not None and self.pooling_hidden_dim is not None and self.pooling_hidden_dim[i] is not None: 
+                # pooling_idx, unpooling_idx, x_v_next = self.get_pooling_idx(x_v, self.pooling_factor[i], self.K[i])
+                x, x_v_next, x_s, pooling_idx, unpooling_idx = getattr(self, f"pool_{i}")(x, x_v)
+                unpooling_idxs.insert(0, (x_v, unpooling_idx, x_s))
+                x_v = x_v_next
+
+            x = getattr(self, f"output_{i}")(x)
+        
+        if self.use_skip_connection:
+            if self.return_v:
+                return x, x_v, unpooling_idxs, skip_connections
+            return x, unpooling_idxs, skip_connections
+        if self.return_v:
+            return x, x_v, unpooling_idxs
+        return x, unpooling_idxs
     
+
+
+
 class MHAIdxDecoder(nn.Module):
     def __init__(self,  input_dim=3, output_dim=1, K=[27], num_heads=[16], stages=[16], dropout=0.1, pooling_hidden_dim=[8], conv_v_kernel_size=None, feed_forward_hidden_dim=None, return_sorted=True, use_skip_connection=False, use_layer_norm=False, use_direction=False, time_embed_dim=None):
         super(MHAIdxDecoder, self).__init__()

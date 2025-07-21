@@ -8,7 +8,7 @@ from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence as pack_sequen
 
 import lightning as L
 from lightning.pytorch.core import LightningDataModule
-
+import math
 from torchvision import transforms as T
 import sys
 from vtk.util.numpy_support import vtk_to_numpy
@@ -112,6 +112,134 @@ class SaxiDataset(Dataset):
         return utils.ReadSurf(surf_path)
     def getSurfPath(self, idx):
         return self.df.iloc[idx][self.surf_column]
+
+class SaxiPCDataset(Dataset):
+
+    def __init__(self, df, mount_point="./", transform=None, surf_column="hilbert_space", 
+                 class_column=None, **kwargs):
+        self.df = df
+        self.mount_point = mount_point
+        self.transform = transform
+        self.surf_column = surf_column
+        self.class_column = class_column
+
+    def __len__(self):
+        return len(self.df.index)
+
+    def __getitem__(self, idx):
+        pc = torch.tensor(self.getSurf(idx)[0])
+
+        if self.transform:
+            pc = self.random_rotate_point_cloud(pc)
+
+        if self.class_column:
+            cl = torch.tensor(self.df.iloc[idx][self.class_column], dtype=torch.int64)
+            return pc, cl
+
+        return pc
+
+    def getSurf(self, idx):
+        pc_path = os.path.join(self.mount_point, self.df.iloc[idx][self.surf_column])
+        return np.load(pc_path)
+    def getSurfPath(self, idx):
+        return self.df.iloc[idx][self.surf_column]
+
+    def random_rotate_point_cloud(self, pc):
+        """ pc: (N, 3) """
+        angles = torch.rand(3) * 2 * torch.pi
+        Rx = torch.tensor([
+            [1, 0, 0],
+            [0, torch.cos(angles[0]), -torch.sin(angles[0])],
+            [0, torch.sin(angles[0]),  torch.cos(angles[0])]
+        ])
+        Ry = torch.tensor([
+            [torch.cos(angles[1]), 0, torch.sin(angles[1])],
+            [0, 1, 0],
+            [-torch.sin(angles[1]), 0, torch.cos(angles[1])]
+        ])
+        Rz = torch.tensor([
+            [torch.cos(angles[2]), -torch.sin(angles[2]), 0],
+            [torch.sin(angles[2]),  torch.cos(angles[2]), 0],
+            [0, 0, 1]
+        ])
+        R = torch.matmul(Rz, torch.matmul(Ry,Rx))
+        return torch.matmul(pc, R.T)
+
+
+class SaxiPCFBDataset(Dataset):
+    #This class is designed to make it easier to work with 3D surface data stored in files
+    #It provides methods for loading and preprocessing the data and allows for flexible configurations depending on the specific use case
+    def __init__(self, df, mount_point="./", pc_transform = None, transform=None, surf_column="surf", surf_property=None, pc_column= 'hilbert_space', class_column=None, scalar_column=None, CN=True, **kwargs):
+        self.df = df
+        self.mount_point = mount_point
+        self.transform = transform
+        self.surf_column = surf_column
+        self.surf_property = surf_property
+        self.class_column = class_column
+        self.pc_column = pc_column
+        self.pc_transform = pc_transform
+        self.scalar_column = scalar_column
+        self.CN = CN
+
+    def __len__(self):
+        return len(self.df.index)
+
+    def __getitem__(self, idx):
+
+        pc_path = os.path.join(self.mount_point, self.df.iloc[idx][self.pc_column])
+        pc_path = pc_path.replace('/npy/','/4096_npy/')
+        pc = torch.tensor(np.load(pc_path)[0]).unsqueeze(0)
+        # if self.pc_transform :
+        #     pc = self.random_rotate_point_cloud(pc)
+        surf = self.getSurf(idx)
+
+        if self.transform:
+            surf = self.transform(surf)
+
+        verts, faces = utils.PolyDataToTensors_v_f(surf)
+
+        if self.CN:
+            surf = utils.ComputeNormals(surf)
+            color_normals = torch.tensor(vtk_to_numpy(utils.GetColorArray(surf, "Normals"))).to(torch.float32)/255.0
+        
+        if self.class_column:
+            cl = torch.tensor(self.df.iloc[idx][self.class_column], dtype=torch.int64)
+            if self.CN:
+                return pc, verts, faces, color_normals, cl
+            else:
+                return pc, verts, faces, cl
+            
+        if self.CN:
+            return pc, verts, faces, color_normals
+        return pc, verts, faces
+
+    def getSurf(self, idx):
+        surf_path = os.path.join(self.mount_point, self.df.iloc[idx][self.surf_column])
+        return utils.ReadSurf(surf_path)
+    def getSurfPath(self, idx):
+        return self.df.iloc[idx][self.surf_column]
+
+    def random_rotate_point_cloud(self, pc):
+        """ pc: (N, 3) """
+        angles = torch.rand(3) * 2 * torch.pi
+        Rx = torch.tensor([
+            [1, 0, 0],
+            [0, torch.cos(angles[0]), -torch.sin(angles[0])],
+            [0, torch.sin(angles[0]),  torch.cos(angles[0])]
+        ])
+        Ry = torch.tensor([
+            [torch.cos(angles[1]), 0, torch.sin(angles[1])],
+            [0, 1, 0],
+            [-torch.sin(angles[1]), 0, torch.cos(angles[1])]
+        ])
+        Rz = torch.tensor([
+            [torch.cos(angles[2]), -torch.sin(angles[2]), 0],
+            [torch.sin(angles[2]),  torch.cos(angles[2]), 0],
+            [0, 0, 1]
+        ])
+        R = torch.matmul(Rz, torch.matmul(Ry,Rx))
+        return torch.matmul(pc, R.T)
+
 
 class SaxiDatasetPreLoad(SaxiDataset):
     #This class is designed to make it easier to work with 3D surface data stored in files
@@ -313,6 +441,155 @@ class SaxiDataModuleVF(LightningDataModule):
 
     def test_dataloader(self):
         return DataLoader(self.test_ds, batch_size=1, num_workers=self.num_workers, persistent_workers=True, pin_memory=True, collate_fn=self.pad_verts_faces)
+
+
+
+class SaxiPCDataModule(LightningDataModule):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.save_hyperparameters(logger=False)
+
+        self.df_train = pd.read_csv(self.hparams.csv_train)
+        self.df_val = pd.read_csv(self.hparams.csv_valid)
+        self.df_test = pd.read_csv(self.hparams.csv_test)
+        self.mount_point = self.hparams.mount_point
+        self.batch_size = self.hparams.batch_size
+        self.num_workers = self.hparams.num_workers
+        self.surf_column = self.hparams.surf_column
+        self.class_column = self.hparams.class_column
+        self.train_transform = self.hparams.train_transform
+        self.valid_transform = self.hparams.valid_transform
+        self.test_transform = self.hparams.test_transform
+        self.drop_last = self.hparams.drop_last
+
+    @staticmethod
+    def add_data_specific_args(parent_parser):
+
+        group = parent_parser.add_argument_group("SaxiDataModule")
+        
+        group.add_argument('--batch_size', type=int, default=16)
+        group.add_argument('--num_workers', type=int, default=6)
+        group.add_argument('--surf_column', type=str, default=None)
+        group.add_argument('--class_column', type=str, default=None)
+        group.add_argument('--pc_column', type=str, default=None)
+        group.add_argument('--csv_train', type=str, default=None)
+        group.add_argument('--csv_valid', type=str, default=None)
+        group.add_argument('--csv_test', type=str, default=None)
+        group.add_argument('--mount_point', type=str, default="./")
+        group.add_argument('--train_transform', type=Callable, default=None)
+        group.add_argument('--valid_transform', type=Callable, default=None)
+        group.add_argument('--test_transform', type=Callable, default=None)
+        group.add_argument('--drop_last', type=bool, default=True)
+
+        return parent_parser
+
+    def setup(self, stage=None):
+        # Assign train/val datasets for use in dataloaders
+        # pc_transform = T.RandomRotation(degrees=30, expand=True)
+        self.train_ds = SaxiPCDataset(self.df_train, self.mount_point, surf_column=self.surf_column, class_column=self.class_column, transform=self.train_transform, pc_transform=True)
+        self.val_ds = SaxiPCDataset(self.df_val, self.mount_point, surf_column=self.surf_column, class_column=self.class_column, transform=self.valid_transform)
+        self.test_ds = SaxiPCDataset(self.df_test, self.mount_point, surf_column=self.surf_column, class_column=self.class_column, transform=self.test_transform)
+    
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, pin_memory=True, shuffle=True, drop_last=self.drop_last)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers, pin_memory=True, drop_last=self.drop_last)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_ds, batch_size=1, num_workers=self.num_workers, pin_memory=True,)
+
+class SaxiPCFBDataModule(LightningDataModule):
+    #It provides a structured and configurable way to load, preprocess, and organize 3D surface data for machine learning tasks, based on the specific requirements of the model type
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.save_hyperparameters(logger=False)
+
+        self.df_train = pd.read_csv(self.hparams.csv_train)
+        self.df_val = pd.read_csv(self.hparams.csv_valid)
+        self.df_test = pd.read_csv(self.hparams.csv_test)
+        self.mount_point = self.hparams.mount_point
+        self.batch_size = self.hparams.batch_size
+        self.num_workers = self.hparams.num_workers
+        self.color_normals = self.hparams.color_normals
+        self.surf_column = self.hparams.surf_column
+        self.class_column = self.hparams.class_column
+        self.train_transform = self.hparams.train_transform
+        self.valid_transform = self.hparams.valid_transform
+        self.test_transform = self.hparams.test_transform
+        self.drop_last = self.hparams.drop_last
+
+    @staticmethod
+    def add_data_specific_args(parent_parser):
+
+        group = parent_parser.add_argument_group("SaxiDataModule")
+        
+        group.add_argument('--batch_size', type=int, default=16)
+        group.add_argument('--num_workers', type=int, default=6)
+        group.add_argument('--surf_column', type=str, default=None)
+        group.add_argument('--class_column', type=str, default=None)
+        group.add_argument('--color_normals', type=int, default=1)
+        group.add_argument('--csv_train', type=str, default=None)
+        group.add_argument('--csv_valid', type=str, default=None)
+        group.add_argument('--csv_test', type=str, default=None)
+        group.add_argument('--mount_point', type=str, default="./")
+        group.add_argument('--train_transform', type=Callable, default=None)
+        group.add_argument('--drop_last', type=bool, default=True)
+
+        return parent_parser
+
+    def setup(self, stage=None):
+        # Assign train/val datasets for use in dataloaders
+        # random_rotation = saxi_transforms.RandomRotation()
+        # pc_transform = T.RandomRotation(degrees=30, expand=True)
+
+        g_train = self.df_train.groupby(self.class_column)
+        self.df_train = g_train.apply(lambda x: x.sample(g_train.size().min())).reset_index(drop=True).sample(frac=1).reset_index(drop=True)
+
+        self.train_ds = SaxiPCFBDataset(self.df_train, self.mount_point, surf_column=self.surf_column, CN=self.color_normals, class_column=self.class_column, transform=self.train_transform, pc_transform=True)
+        self.val_ds = SaxiPCFBDataset(self.df_val, self.mount_point, surf_column=self.surf_column, CN=self.color_normals, class_column=self.class_column)
+        self.test_ds = SaxiPCFBDataset(self.df_test, self.mount_point, surf_column=self.surf_column, CN=self.color_normals, class_column=self.class_column)
+
+    def pad_verts_faces(self, batch):
+        # Collate function for the dataloader to know how to comine the data
+
+        if self.class_column :
+            pc = [x for x, v, f, cn, l in batch]
+            verts = [v for x, v, f, cn, l in batch]
+            faces = [f for x, v, f, cn, l in batch]        
+            color_normals = [cn for x, v, f, cn, l in batch]
+            labels = [l for x, v, f, cn, l in batch]  
+            
+            verts = pad_sequence(verts, batch_first=True, padding_value=0.0)        
+            faces = pad_sequence(faces, batch_first=True, padding_value=-1)        
+            color_normals = pad_sequence(color_normals, batch_first=True, padding_value=0.0)
+            labels = torch.tensor(labels)
+            pc = torch.cat(pc)
+            
+            return pc, verts, faces, color_normals, labels
+        
+        else:
+            pc = [x for x, v, f, cn, l in batch]
+            verts = [v for x, v, f, cn in batch]
+            faces = [f for x, v, f, cn in batch]        
+            color_normals = [cn for x, v, f, cn in batch]            
+            
+            verts = pad_sequence(verts, batch_first=True, padding_value=0.0)        
+            faces = pad_sequence(faces, batch_first=True, padding_value=-1)        
+            color_normals = pad_sequence(color_normals, batch_first=True, padding_value=0.0)
+            pc = torch.cat(pc)
+
+            return pc, verts, faces, color_normals
+            
+
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, pin_memory=True, shuffle=True, drop_last=self.drop_last, collate_fn=self.pad_verts_faces)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers, pin_memory=True, drop_last=self.drop_last, collate_fn=self.pad_verts_faces)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_ds, batch_size=1, num_workers=self.num_workers, pin_memory=True, collate_fn=self.pad_verts_faces)
 
 
 class SaxiDataModuleVFPreLoad(SaxiDataModuleVF):
