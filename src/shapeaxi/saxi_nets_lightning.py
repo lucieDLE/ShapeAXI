@@ -65,7 +65,6 @@ from diffusers.models import UNet2DConditionModel
 from generative.inferers import DiffusionInferer as MonaiDiffusionInferer
 from generative.networks.schedulers import DDPMScheduler as MonaiDDPMScheduler
 
-from shapeaxi.saxi_flows import SaxiCouplingFlow
 import monai.networks.nets as monai_nets
 
 class SaxiClassification(LightningModule):
