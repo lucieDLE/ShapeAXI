@@ -28,7 +28,8 @@ Welcome to the official documentation for **ShapeAXI**. Dive into the cutting-ed
 
 ## Installation
 
-(python 3.8 or 3.9 are required, no other versions)
+(3.9 to 3.12 are required, no other versions)
+you will also need GCC >= 9.0
 
 ### Installation of shapeaxi
 ```bash
@@ -37,20 +38,14 @@ pip install shapeaxi
 
 ### Installation of pytorch3d 
 
-For this installation, we are going to use a variable, **{YOURVERSION}**, because this installation is specific to each computer configuration.
-First, you can run this line to print the content of the variable **{YOURVERSION}** that we will use :
+- You can install pytorch3d with this command or see the [official documentation](https://github.com/facebookresearch/pytorch3d/blob/main/INSTALL.md).
 ```bash
-python -c "import sys; import torch; pyt_version_str=torch.__version__.split('+')[0].replace('.', ''); version_str=''.join([f'py3{sys.version_info.minor}_cu', torch.version.cuda.replace('.', ''), f'_pyt{pyt_version_str}']); print(version_str)"
-```
-It will print something like this : **py39_cu117_pyt201**.  
-- Finally, you can run this line by adding your editing **{YOURVERSION}**, 
-```bash
-pip install --no-index --no-cache-dir pytorch3d -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/{YOURVERSION}/download.html
+pip install "git+https://github.com/facebookresearch/pytorch3d.git"
 ```
 
 Finally, check the installation,
 ```bash
-pip show pytorch3d
+python -c "import pytorch3d.renderer"
 ```
 ---
 
